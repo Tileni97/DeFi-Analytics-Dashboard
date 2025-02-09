@@ -1,11 +1,11 @@
-# defi/views.py (Updated)
 import logging
 import requests
 from django.core.cache import cache
-from django.shortcuts import render
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from django.conf import settings
+from datetime import datetime
 from .models import (
     YieldData,
     GovernanceProposal,
@@ -13,14 +13,14 @@ from .models import (
     OnChainData,
     RiskScore,
     TechnicalData,
-)  # Updated
+)
 from .serializers import (
     YieldDataSerializer,
     GovernanceProposalSerializer,
     RiskMetricSerializer,
-    OnChainDataSerializer,  # New
-    RiskScoreSerializer,  # New
-    TechnicalDataSerializer,  # New
+    OnChainDataSerializer,
+    RiskScoreSerializer,
+    TechnicalDataSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,74 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 50
 
 
-# Yield Data Endpoints (Existing Code - Do Not Modify)
+# Utility function to fetch and cache data
+def fetch_and_cache_data(url, model, serializer, cache_key):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            response_data = response.json()
+            logger.info(f"API Response: {response_data}")  # Log the entire API response
+
+            if isinstance(response_data, dict) and "data" in response_data:
+                data = response_data["data"]
+            else:
+                data = response_data
+
+            if not isinstance(data, list):
+                logger.error(f"Unexpected data format: {type(data)}")
+                return False
+
+            # Log the first few items for debugging
+            for i, item in enumerate(data[:5]):
+                logger.info(f"Item {i}: {item}")
+
+            objects = []
+            model_fields = [f.name for f in model._meta.get_fields()]
+
+            for item in data:
+                if not isinstance(item, dict):
+                    logger.error(f"Skipping invalid item: {item}")
+                    continue
+
+                # Log the item for debugging
+                logger.info(f"Processing item: {item}")
+
+                # Filter out fields that are not in the model
+                filtered_item = {k: v for k, v in item.items() if k in model_fields}
+
+                # Ensure required fields are populated
+                if model == RiskScore:
+                    # Map API fields to RiskScore model fields
+                    filtered_item["protocol"] = item.get(
+                        "name", ""
+                    )  # Use "name" as protocol
+                    filtered_item["risk_score"] = item.get(
+                        "mcap", 0.0
+                    )  # Use "mcap" as risk_score
+                    filtered_item["audit_status"] = item.get(
+                        "audit_note", ""
+                    )  # Use "audit_note" as audit_status
+
+                try:
+                    objects.append(model(**filtered_item))
+                except Exception as e:
+                    logger.error(f"Error creating model instance: {e}")
+
+            model.objects.all().delete()
+            model.objects.bulk_create(objects)
+
+            serialized_data = serializer(objects, many=True).data
+            cache.set(cache_key, serialized_data, CACHE_TIMEOUT)
+            return True
+        else:
+            logger.error(f"Failed to fetch data from {url}: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.exception(f"Error fetching data from {url}")
+        return False
+
+
+# Yield Data Endpoints
 @api_view(["GET"])
 def fetch_yield_data(request):
     """Fetch yield farming data from DeFiLlama API and update database."""
@@ -43,17 +110,46 @@ def fetch_yield_data(request):
 
         if response.status_code == 200:
             data = response.json().get("data", [])[:10]  # Limit to top 10
-            logger.info(
-                f"Fetched {len(data)} yield data entries"
-            )  # Log the number of entries
+            logger.info(f"Fetched {len(data)} yield data entries")
             yield_objects = []
 
             for item in data:
                 yield_objects.append(
                     YieldData(
-                        protocol=item["project"],
-                        apy=item["apy"],
-                        tvl=item["tvlUsd"],
+                        chain=item.get("chain"),
+                        project=item.get("project"),
+                        symbol=item.get("symbol"),
+                        tvlUsd=item.get("tvlUsd"),
+                        apyBase=item.get("apyBase"),
+                        apyReward=item.get("apyReward"),  # Can be NULL
+                        apy=item.get("apy"),
+                        rewardTokens=item.get(
+                            "rewardTokens", []
+                        ),  # Default to empty list if missing
+                        pool=item.get("pool"),
+                        apyPct1D=item.get("apyPct1D"),
+                        apyPct7D=item.get("apyPct7D"),
+                        apyPct30D=item.get("apyPct30D"),
+                        stablecoin=item.get("stablecoin", False),
+                        ilRisk=item.get("ilRisk"),
+                        exposure=item.get("exposure"),
+                        predictions=item.get(
+                            "predictions", {}
+                        ),  # Default to empty dict if missing
+                        poolMeta=item.get("poolMeta"),
+                        mu=item.get("mu"),
+                        sigma=item.get("sigma"),
+                        count=item.get("count"),
+                        outlier=item.get("outlier", False),
+                        underlyingTokens=item.get(
+                            "underlyingTokens", []
+                        ),  # Default to empty list if missing
+                        il7d=item.get("il7d"),
+                        apyBase7d=item.get("apyBase7d"),
+                        apyMean30d=item.get("apyMean30d"),
+                        volumeUsd1d=item.get("volumeUsd1d"),
+                        volumeUsd7d=item.get("volumeUsd7d"),
+                        apyBaseInception=item.get("apyBaseInception"),
                     )
                 )
 
@@ -75,7 +171,6 @@ def fetch_yield_data(request):
 
 @api_view(["GET"])
 def get_yield_data(request):
-    """Get stored yield farming data with pagination and caching."""
     cached_data = cache.get("yield_data")
     if cached_data:
         return Response(cached_data)
@@ -87,15 +182,12 @@ def get_yield_data(request):
     return paginator.get_paginated_response(serializer.data)
 
 
-# Governance Data Endpoints (Existing Code - Do Not Modify)
+# Governance Data Endpoints
 @api_view(["GET"])
 def fetch_governance_data(request):
     """Fetch governance data from Snapshot API."""
     try:
-        proposals = []
-
-        # Fetch Snapshot governance data
-        snapshot_url = "https://hub.snapshot.org/graphql"
+        url = "https://hub.snapshot.org/graphql"
         query = """
         {
           proposals(first: 10, where: { space_in: ["aave.eth", "compound-governance.eth"] }) {
@@ -108,49 +200,31 @@ def fetch_governance_data(request):
           }
         }
         """
-        response = requests.post(snapshot_url, json={"query": query}, timeout=10)
+        response = requests.post(url, json={"query": query}, timeout=10)
         if response.status_code == 200:
-            snapshot_proposals = response.json().get("data", {}).get("proposals", [])
-            logger.info(
-                f"Snapshot Proposals: {snapshot_proposals}"
-            )  # Log Snapshot proposals
-            for proposal in snapshot_proposals:
+            data = response.json().get("data", {}).get("proposals", [])
+            proposals = []
+            for proposal in data:
                 proposals.append(
                     GovernanceProposal(
                         protocol=proposal["space"]["id"],
-                        proposal_id=proposal["id"],
+                        proposal_id=proposal["id"],  # String value
                         title=proposal["title"],
                         status=proposal["state"],
                     )
                 )
-        else:
-            logger.warning(
-                f"Failed to fetch Snapshot proposals: {response.status_code}"
+
+            GovernanceProposal.objects.all().delete()
+            GovernanceProposal.objects.bulk_create(proposals)
+            cache.set(
+                "governance_data",
+                GovernanceProposalSerializer(proposals, many=True).data,
+                CACHE_TIMEOUT,
             )
-            logger.warning(
-                f"Snapshot API Response: {response.text}"
-            )  # Log the response body
-
-        # Fallback data if no proposals are found
-        if not proposals:
-            proposals = [
-                GovernanceProposal(
-                    protocol="Fallback",
-                    proposal_id="1",
-                    title="Sample Proposal",
-                    status="Active",
-                )
-            ]
-            logger.warning("No governance proposals found. Using fallback data.")
-
-        GovernanceProposal.objects.all().delete()
-        GovernanceProposal.objects.bulk_create(proposals)
-        cache.set(
-            "governance_data",
-            GovernanceProposalSerializer(proposals, many=True).data,
-            CACHE_TIMEOUT,
-        )
-        return Response({"message": "Governance data updated successfully!"})
+            return Response({"message": "Governance data updated successfully!"})
+        else:
+            logger.error(f"Failed to fetch governance data: {response.status_code}")
+            return Response({"error": "Failed to fetch data"}, status=500)
     except Exception as e:
         logger.exception("Error fetching governance data")
         return Response({"error": str(e)}, status=500)
@@ -158,7 +232,6 @@ def fetch_governance_data(request):
 
 @api_view(["GET"])
 def get_governance_data(request):
-    """Get stored governance proposals with pagination and caching."""
     cached_data = cache.get("governance_data")
     if cached_data:
         return Response(cached_data)
@@ -170,105 +243,89 @@ def get_governance_data(request):
     return paginator.get_paginated_response(serializer.data)
 
 
-# Risk Metrics Endpoints (Existing Code - Do Not Modify)
+# Risk Metrics Endpoints
 @api_view(["GET"])
 def fetch_risk_metrics(request):
-    """Fetch risk metrics from DeFiLlama API."""
-    try:
-        url = "https://api.llama.fi/protocols"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            protocols = [p for p in data if isinstance(p.get("tvl"), (int, float))]
-
-            top_protocols = sorted(
-                protocols, key=lambda x: float(x["tvl"]), reverse=True
-            )[:15]
-            risk_objects = []
-            for protocol in top_protocols:
-                risk_objects.append(
-                    RiskMetric(
-                        protocol=protocol["name"],
-                        category=protocol.get("category", "Other"),
-                        tvl=float(protocol.get("tvl", 0)),
-                        tvl_change_24h=float(protocol.get("change_1d", 0) or 0),
-                        dominance_ratio=float(protocol.get("dominance", 0) or 0),
-                        volatility_30d=float(protocol.get("volatility_30d", 0) or 0),
-                    )
-                )
-
-            RiskMetric.objects.all().delete()
-            RiskMetric.objects.bulk_create(risk_objects)
-            cache.set(
-                "risk_metrics",
-                RiskMetricSerializer(risk_objects, many=True).data,
-                CACHE_TIMEOUT,
-            )
-            return Response({"message": "Risk metrics updated successfully!"})
-        else:
-            logger.error(f"Failed to fetch risk metrics: {response.status_code}")
-            return Response({"error": "Failed to fetch risk metrics"}, status=500)
-    except Exception as e:
-        logger.exception("Error fetching risk metrics")
-        return Response({"error": str(e)}, status=500)
+    url = "https://api.llama.fi/protocols"
+    if fetch_and_cache_data(url, RiskMetric, RiskMetricSerializer, "risk_metrics"):
+        return Response({"message": "Risk metrics updated successfully!"})
+    else:
+        return Response({"error": "Failed to fetch data"}, status=500)
 
 
 @api_view(["GET"])
 def get_risk_metrics(request):
-    """Get stored risk metrics with pagination and caching."""
     cached_data = cache.get("risk_metrics")
     if cached_data:
         return Response(cached_data)
 
-    data = RiskMetric.objects.all().order_by("-tvl")
+    # Default ordering field
+    ordering_field = request.query_params.get("ordering", "-mcap")
+
+    # Validate that the ordering field exists in the model
+    valid_fields = [f.name for f in RiskMetric._meta.get_fields()]
+    if ordering_field.lstrip("-") not in valid_fields:
+        return Response(
+            {"error": f"Invalid ordering field: {ordering_field}"}, status=400
+        )
+
+    # Order by the validated field
+    data = RiskMetric.objects.all().order_by(ordering_field)
     paginator = StandardPagination()
     result_page = paginator.paginate_queryset(data, request)
     serializer = RiskMetricSerializer(result_page, many=True)
     return paginator.get_paginated_response(serializer.data)
 
 
-# New: Fetch On-Chain Data
+# On-Chain Data Endpoints
 @api_view(["GET"])
 def fetch_on_chain_data(request):
-    """Fetch on-chain data from Dune Analytics, DeFiLlama, and Etherscan."""
+    data = {}
     try:
-        # Example: Fetch transaction volume from Dune Analytics
-        dune_url = "https://api.dune.com/api/v1/query/<QUERY_ID>/results"
-        dune_response = requests.get(dune_url, timeout=10)
-        dune_data = dune_response.json().get("result", {}).get("rows", [])
+        # Fetch TVL data
+        tvl_url = "https://api.llama.fi/charts"
+        tvl_response = requests.get(tvl_url, timeout=10)
+        if tvl_response.status_code == 200:
+            data["tvl"] = tvl_response.json()
+    except Exception as e:
+        logger.error(f"TVL data fetch failed: {e}")
 
-        # Example: Fetch TVL from DeFiLlama
-        defillama_url = "https://api.llama.fi/protocols"
-        defillama_response = requests.get(defillama_url, timeout=10)
-        defillama_data = defillama_response.json()
-
-        # Example: Fetch wallet balance from Etherscan
-        etherscan_url = "https://api.etherscan.io/api?module=account&action=balance&address=<WALLET_ADDRESS>&tag=latest&apikey=<API_KEY>"
-        etherscan_response = requests.get(etherscan_url, timeout=10)
-        etherscan_data = etherscan_response.json()
-
-        # Save data to database
-        OnChainData.objects.all().delete()
-        OnChainData.objects.create(
-            transaction_volume=dune_data,
-            tvl=defillama_data,
-            wallet_balance=etherscan_data,
+    try:
+        # Fetch DeFi market data
+        cg_url = "https://api.coingecko.com/api/v3/global/defi"
+        cg_response = requests.get(
+            cg_url, headers={"x-cg-api-key": settings.COINGECKO_API_KEY}, timeout=10
         )
+        if cg_response.status_code == 200:
+            data["market"] = cg_response.json()
+    except Exception as e:
+        logger.error(f"CoinGecko data fetch failed: {e}")
 
-        cache.set(
-            "on_chain_data",
-            OnChainDataSerializer(OnChainData.objects.first()).data,
-            CACHE_TIMEOUT,
+    if not data:
+        return Response({"error": "All data fetches failed"}, status=500)
+
+    # Process whatever data we successfully retrieved
+    try:
+        OnChainData.objects.update_or_create(
+            id=1,
+            defaults={
+                "transaction_volume": data.get("market", {})
+                .get("data", {})
+                .get("trading_volume_24h", 0),
+                "tvl": data.get("tvl", []),
+                "wallet_balance": data.get("market", {})
+                .get("data", {})
+                .get("market_cap", 0),
+            },
         )
         return Response({"message": "On-chain data updated successfully!"})
     except Exception as e:
-        logger.exception("Error fetching on-chain data")
+        logger.exception("Error saving on-chain data")
         return Response({"error": str(e)}, status=500)
 
 
 @api_view(["GET"])
 def get_on_chain_data(request):
-    """Get stored on-chain data with caching."""
     cached_data = cache.get("on_chain_data")
     if cached_data:
         return Response(cached_data)
@@ -278,20 +335,29 @@ def get_on_chain_data(request):
     return Response(serializer.data)
 
 
-# New: Simulate Governance Vote
+# Simulate Governance Vote
 @api_view(["POST"])
 def simulate_governance_vote(request):
-    """Simulate a governance vote."""
     try:
         proposal_id = request.data.get("proposal_id")
         vote = request.data.get("vote")  # "FOR" or "AGAINST"
 
-        # Simulate vote logic (e.g., update vote count in database)
-        proposal = GovernanceProposal.objects.get(proposal_id=proposal_id)
+        # Check if the proposal exists
+        try:
+            proposal = GovernanceProposal.objects.get(proposal_id=proposal_id)
+        except GovernanceProposal.DoesNotExist:
+            return Response({"error": "Proposal not found"}, status=404)
+
+        # Update the vote count
         if vote == "FOR":
             proposal.for_votes += 1
         elif vote == "AGAINST":
             proposal.against_votes += 1
+        else:
+            return Response(
+                {"error": "Invalid vote type. Use 'FOR' or 'AGAINST'."}, status=400
+            )
+
         proposal.save()
 
         return Response(
@@ -302,100 +368,48 @@ def simulate_governance_vote(request):
         return Response({"error": str(e)}, status=500)
 
 
-# New: Fetch Risk Scores
+# Risk Scores Endpoints
 @api_view(["GET"])
 def fetch_risk_scores(request):
-    """Fetch risk scores from CertiK or OpenZeppelin."""
-    try:
-        certik_url = "https://api.certik.com/v1/protocols/<PROTOCOL>/risks"
-        certik_response = requests.get(certik_url, timeout=10)
-        certik_data = certik_response.json()
-
-        # Save data to database
-        RiskScore.objects.all().delete()
-        RiskScore.objects.create(
-            protocol=certik_data.get("protocol"),
-            risk_score=certik_data.get("risk_score"),
-            audit_status=certik_data.get("audit_status"),
-        )
-
-        cache.set(
-            "risk_scores",
-            RiskScoreSerializer(RiskScore.objects.first()).data,
-            CACHE_TIMEOUT,
-        )
+    url = "https://api.llama.fi/protocols"
+    if fetch_and_cache_data(url, RiskScore, RiskScoreSerializer, "risk_scores"):
         return Response({"message": "Risk scores updated successfully!"})
-    except Exception as e:
-        logger.exception("Error fetching risk scores")
-        return Response({"error": str(e)}, status=500)
+    else:
+        return Response({"error": "Failed to fetch data"}, status=500)
 
 
 @api_view(["GET"])
 def get_risk_scores(request):
-    """Get stored risk scores with caching."""
     cached_data = cache.get("risk_scores")
     if cached_data:
         return Response(cached_data)
 
-    data = RiskScore.objects.first()
-    serializer = RiskScoreSerializer(data)
-    return Response(serializer.data)
+    data = RiskScore.objects.all().order_by("-risk_score")
+    paginator = StandardPagination()
+    result_page = paginator.paginate_queryset(data, request)
+    serializer = RiskScoreSerializer(result_page, many=True)
+    return paginator.get_paginated_response(serializer.data)
 
 
-# New: Fetch Technical Data
+# Technical Data Endpoints
 @api_view(["GET"])
 def fetch_technical_data(request):
-    """Fetch technical data from The Graph, Etherscan, and Tenderly."""
     try:
-        # Example: Fetch Uniswap data from The Graph
-        the_graph_url = "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"
-        the_graph_query = """
-        {
-          swaps(first: 10) {
-            id
-            amountUSD
-            timestamp
-          }
-        }
-        """
-        the_graph_response = requests.post(
-            the_graph_url, json={"query": the_graph_query}, timeout=10
-        )
-        the_graph_data = the_graph_response.json().get("data", {}).get("swaps", [])
+        price_url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_vol=true"
+        price_response = requests.get(price_url, timeout=10)
+        price_data = price_response.json()
 
-        # Example: Fetch wallet transactions from Etherscan
-        etherscan_url = "https://api.etherscan.io/api?module=account&action=txlist&address=<WALLET_ADDRESS>&startblock=0&endblock=99999999&sort=asc&apikey=<API_KEY>"
-        etherscan_response = requests.get(etherscan_url, timeout=10)
-        etherscan_data = etherscan_response.json().get("result", [])
+        protocols_url = "https://api.llama.fi/protocols"
+        protocols_response = requests.get(protocols_url, timeout=10)
+        protocol_data = protocols_response.json()
 
-        # Example: Simulate transaction using Tenderly
-        tenderly_url = "https://api.tenderly.co/api/v1/simulate"
-        tenderly_payload = {
-            "network_id": "1",
-            "from": "<FROM_ADDRESS>",
-            "to": "<TO_ADDRESS>",
-            "input": "<INPUT_DATA>",
-        }
-        tenderly_response = requests.post(
-            tenderly_url,
-            json=tenderly_payload,
-            headers={"X-Access-Key": "<API_KEY>"},
-            timeout=10,
-        )
-        tenderly_data = tenderly_response.json()
-
-        # Save data to database
-        TechnicalData.objects.all().delete()
-        TechnicalData.objects.create(
-            uniswap_data=the_graph_data,
-            wallet_transactions=etherscan_data,
-            tenderly_simulation=tenderly_data,
-        )
-
-        cache.set(
-            "technical_data",
-            TechnicalDataSerializer(TechnicalData.objects.first()).data,
-            CACHE_TIMEOUT,
+        TechnicalData.objects.update_or_create(
+            id=1,
+            defaults={
+                "uniswap_data": protocol_data,
+                "wallet_transactions": price_data,
+                "tenderly_simulation": {},
+            },
         )
         return Response({"message": "Technical data updated successfully!"})
     except Exception as e:
@@ -405,7 +419,6 @@ def fetch_technical_data(request):
 
 @api_view(["GET"])
 def get_technical_data(request):
-    """Get stored technical data with caching."""
     cached_data = cache.get("technical_data")
     if cached_data:
         return Response(cached_data)
